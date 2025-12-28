@@ -1,9 +1,10 @@
-const { ethers, Wallet, WebSocketProvider, Contract } = require('ethers');
+const { ethers, Wallet, WebSocketProvider, Contract, Interface } = require('ethers');
+require('dotenv').config();
 
 const CONFIG = {
     CHAIN_ID: 8453,
     TARGET_CONTRACT: "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0",
-    WSS_URL: "wss://base-mainnet.g.alchemy.com/v2/YOUR_API_KEY",
+    WSS_URL: process.env.WSS_URL, // 🚨 Ensure this is a BASE MAINNET WSS key
     WETH: "0x4200000000000000000000000000000000000006",
     USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     WETH_USDC_POOL: "0x88A43bb75941904d47401946215162a26bc773dc",
@@ -12,100 +13,85 @@ const CONFIG = {
     MARGIN_ETH: "0.005"
 };
 
-// Expanded ABIs for safety
-const PAIR_ABI = [
-    "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
-    "function token0() external view returns (address)"
-];
-const TITAN_ABI = ["function requestTitanLoan(address asset, uint256 amount, address[] path) external returns (uint256)"];
+const PAIR_ABI = ["function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)"];
+const SWAP_EVENT_ABI = ["event Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to)"];
 
 async function startWhaleStriker() {
-    console.log(`\n🔱 APEX TITAN: DEPLOYED ON BASE`);
-    
-    const provider = new WebSocketProvider(CONFIG.WSS_URL);
-    const signer = new Wallet(process.env.TREASURY_PRIVATE_KEY, provider);
-    const poolContract = new Contract(CONFIG.WETH_USDC_POOL, PAIR_ABI, provider);
-    const titanInterface = new ethers.Interface(TITAN_ABI);
+    console.log(`\n🔱 APEX TITAN: CONNECTING TO BASE...`);
 
-    // Dynamic Liquidity Scaling
-    async function getSafeLoanAmount() {
-        try {
-            const [res0, res1] = await poolContract.getReserves();
-            // In WETH/USDC on Base, res0 is WETH.
-            const poolWethReserves = res0; 
-            
-            // Limit Flash Loan to 10% of Pool depth to minimize price impact/slippage
-            const maxSafeAmount = poolWethReserves / 10n; 
-            
-            // Standard whale strike size
-            let requestedAmount = ethers.parseEther("50"); 
-            
-            if (requestedAmount > maxSafeAmount) {
-                console.log(`⚠️ Pool Depth Low: Scaling loan to ${ethers.formatEther(maxSafeAmount)} ETH`);
-                return maxSafeAmount;
-            }
-            return requestedAmount;
-        } catch (e) {
-            return ethers.parseEther("2"); // Safe floor
-        }
+    let provider;
+    try {
+        provider = new WebSocketProvider(CONFIG.WSS_URL);
+    } catch (e) {
+        console.error("❌ Invalid WSS URL. Check your .env file.");
+        process.exit(1);
     }
 
-    // Filter for Uniswap V2 Swaps
-    const filter = {
-        address: CONFIG.WETH_USDC_POOL,
-        topics: [ethers.id("Swap(address,uint256,uint256,uint256,uint256,address)")]
-    };
-
-    provider.on(filter, async (log) => {
-        try {
-            // Use Interface to decode properly
-            const iface = new ethers.Interface(["event Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to)"]);
-            const parsed = iface.parseLog(log);
-            
-            // We care about the total volume of the swap
-            const volume = parsed.args.amount0In > parsed.args.amount1In ? parsed.args.amount0In : parsed.args.amount1In;
-
-            if (volume < CONFIG.WHALE_MIN_ETH) return;
-
-            console.log(`🐋 Whale Detected: ${ethers.formatEther(volume)} ETH Swap`);
-
-            const safeLoanAmount = await getSafeLoanAmount();
-            const strikeData = titanInterface.encodeFunctionData("requestTitanLoan", [
-                CONFIG.WETH, safeLoanAmount, [CONFIG.WETH, CONFIG.USDC]
-            ]);
-
-            // Simulation with StaticCall (Ethers v6)
-            const potentialProfitHex = await provider.call({
-                to: CONFIG.TARGET_CONTRACT,
-                data: strikeData,
-                from: signer.address
-            });
-            
-            const potentialProfit = BigInt(potentialProfitHex);
-            const feeData = await provider.getFeeData();
-            const gasCost = CONFIG.GAS_LIMIT * (feeData.maxFeePerGas || feeData.gasPrice);
-            const aaveFee = (safeLoanAmount * 5n) / 10000n; // 0.05%
-
-            if (potentialProfit > (gasCost + ethers.parseEther(CONFIG.MARGIN_ETH) + aaveFee)) {
-                const tx = await signer.sendTransaction({
-                    to: CONFIG.TARGET_CONTRACT,
-                    data: strikeData,
-                    gasLimit: CONFIG.GAS_LIMIT,
-                    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
-                    maxFeePerGas: feeData.maxFeePerGas,
-                    type: 2
-                });
-                console.log(`🚀 STRIKE SUCCESSFUL: ${tx.hash}`);
-            }
-        } catch (e) {
-            // Often triggers if simulation reverts (profit not high enough)
+    // --- SAFETY NET: PREVENTS THE 401 CRASH ---
+    provider.on("error", (err) => {
+        console.error("🚨 PROVIDER ERROR:", err.message);
+        if (err.message.includes("401")) {
+            console.error("👉 ACTION REQUIRED: Your Alchemy/QuickNode key is UNAUTHORIZED for Base.");
         }
     });
 
-    provider.websocket.on("close", () => {
-        console.log("WS Closed. Reconnecting...");
+    const signer = new Wallet(process.env.TREASURY_PRIVATE_KEY, provider);
+    const poolContract = new Contract(CONFIG.WETH_USDC_POOL, PAIR_ABI, provider);
+    const iface = new Interface(SWAP_EVENT_ABI);
+
+    console.log(`✅ TITAN DEPLOYED. Monitoring ${CONFIG.WETH_USDC_POOL}`);
+
+    provider.on({ address: CONFIG.WETH_USDC_POOL }, async (log) => {
+        try {
+            const parsed = iface.parseLog(log);
+            if (!parsed) return;
+
+            const vol0 = parsed.args.amount0In > parsed.args.amount0Out ? parsed.args.amount0In : parsed.args.amount0Out;
+            const vol1 = parsed.args.amount1In > parsed.args.amount1Out ? parsed.args.amount1In : parsed.args.amount1Out;
+            const maxSwap = vol0 > vol1 ? vol0 : vol1;
+
+            if (maxSwap < CONFIG.WHALE_MIN_ETH) return;
+
+            console.log(`🐋 Whale Detected: ${ethers.formatEther(maxSwap)} ETH`);
+
+            // Liquidity Guard Logic
+            const [res0] = await poolContract.getReserves();
+            const safeLoan = res0 / 10n; // Never borrow more than 10% of pool
+
+            // Strike Logic
+            const titanIface = new Interface(["function requestTitanLoan(address,uint256,address[])"]);
+            const data = titanIface.encodeFunctionData("requestTitanLoan", [
+                CONFIG.WETH, safeLoan, [CONFIG.WETH, CONFIG.USDC]
+            ]);
+
+            // Simulate & Strike
+            const feeData = await provider.getFeeData();
+            const tx = await signer.sendTransaction({
+                to: CONFIG.TARGET_CONTRACT,
+                data: data,
+                gasLimit: CONFIG.GAS_LIMIT,
+                maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+                maxFeePerGas: feeData.maxFeePerGas,
+                type: 2
+            });
+
+            console.log(`🚀 STRIKE SENT: ${tx.hash}`);
+        } catch (e) {
+            // Silently skip failed simulations (normal in MEV)
+        }
+    });
+
+    // --- RECONNECTION LOOP ---
+    provider.websocket.on("close", (code) => {
+        console.log(`⚠️ Connection Closed (Code: ${code}). Reconnecting in 5s...`);
+        provider.removeAllListeners();
         setTimeout(startWhaleStriker, 5000);
     });
 }
+
+// Global Rejection Handler
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Rejection:', reason);
+});
 
 startWhaleStriker().catch(console.error);
