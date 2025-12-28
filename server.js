@@ -28,7 +28,7 @@ async function startWhaleStriker() {
     const oracleContract = new Contract(CONFIG.GAS_ORACLE, ORACLE_ABI, provider);
     const titanIface = new Interface(TITAN_ABI);
 
-    // Prevent Unhandled Rejections
+    // Prevent Unhandled Rejections from crashing the bot
     provider.on("error", (e) => {
         console.error("🚨 WebSocket Error:", e.message);
     });
@@ -37,7 +37,7 @@ async function startWhaleStriker() {
         try {
             // 1. Get Reserves for Liquidity Scaling
             const [res0] = await poolContract.getReserves();
-            const safeLoan = res0 / 10n; // Use 10% of pool
+            const safeLoan = res0 / 10n; 
 
             // 2. Encode Strike Data
             const strikeData = titanIface.encodeFunctionData("requestTitanLoan", [
@@ -65,7 +65,7 @@ async function startWhaleStriker() {
             const requiredMargin = ethers.parseEther(CONFIG.MARGIN_ETH);
 
             if (netProfit > requiredMargin) {
-                console.log(`💎 PROFIT CONFIRMED: ${ethers.formatEther(netProfit)} ETH (After All Fees)`);
+                console.log(`💎 PROFIT CONFIRMED: ${ethers.formatEther(netProfit)} ETH (Net)`);
                 
                 const tx = await signer.sendTransaction({
                     to: CONFIG.TARGET_CONTRACT,
@@ -78,7 +78,7 @@ async function startWhaleStriker() {
                 console.log(`🚀 STRIKE FIRED: ${tx.hash}`);
             }
         } catch (e) {
-            // Reverts are common in MEV simulation; we ignore them to stay fast
+            // Reverts are common; skip and wait for the next whale
         }
     });
 
@@ -89,6 +89,7 @@ async function startWhaleStriker() {
     });
 }
 
-// Start the Titan
+// Fixed the boot error line here
 startWhaleStriker().catch((err) => {
-    console.error("❌ CRITICAL BOOT ERROR:", err
+    console.error("❌ CRITICAL BOOT ERROR:", err.message);
+});
